@@ -56,16 +56,17 @@ def cache_weights(weights_dir: str) -> dict:
     cached_paths = {}
     for model_id in model_ids:
         print(f"Caching weights for: {model_id}")
-        # Check if the model is already cached
         local_path = os.path.join(weights_dir, model_id.split("/")[-1])
         if os.path.exists(local_path):
             print(f"Already cached at: {local_path}")
             cached_paths[model_id] = local_path
             continue
-        # Download the model and cache it
         print(f"Downloading and caching model: {model_id}")
-        # Use snapshot_download to download the model
-        local_path = snapshot_download(repo_id=model_id, local_dir=os.path.join(weights_dir, model_id.split("/")[-1]), force_download=False)
+        local_path = snapshot_download(
+            repo_id=model_id,
+            local_dir=os.path.join(weights_dir, model_id.split("/")[-1]),
+            force_download=False
+        )
         cached_paths[model_id] = local_path
         print(f"Cached at: {local_path}")
 
@@ -119,28 +120,26 @@ def generate_3d(image, seed=-1,
     
     # Export mesh
     trimesh_mesh = generated_mesh.to_trimesh(transform_pose=True)
-
     trimesh_mesh.export(mesh_path)
 
+    # Return: normal preview image, path for Model3D viewer, and raw path in a State
     return normal_image, mesh_path, mesh_path
 
 def convert_mesh(mesh_path, export_format):
-    """Download the mesh in the selected format."""
+    """Create an exported copy of the mesh and return the path for download."""
     if not mesh_path:
         return None
-    
-    # Create a temporary file to store the mesh data
     temp_file = tempfile.NamedTemporaryFile(suffix=f".{export_format}", delete=False)
     temp_file_path = temp_file.name
-    
-    new_mesh_path = mesh_path.replace(".glb", f".{export_format}")
     mesh = trimesh.load_mesh(mesh_path)
-    mesh.export(temp_file_path)  # Export to the temporary file
-    
-    return temp_file_path # Return the path to the temporary file
+    mesh.export(temp_file_path)
+    return temp_file_path
 
-# Create the Gradio interface with improved layout
-with gr.Blocks(css="footer {visibility: hidden}") as demo:
+# Build UI
+with gr.Blocks() as demo:
+    # Inject CSS safely
+    gr.HTML("<style>footer {visibility: hidden}</style>")
+
     gr.Markdown(
         """
         <h1 style='text-align: center;'>Hi3DGen: High-fidelity 3D Geometry Generation from Images via Normal Bridging</h1>
@@ -173,12 +172,10 @@ with gr.Blocks(css="footer {visibility: hidden}") as demo:
     with gr.Row():
         with gr.Column(scale=1):
             with gr.Tabs():
-                
                 with gr.Tab("Single Image"):
                     with gr.Row():
                         image_prompt = gr.Image(label="Image Prompt", image_mode="RGBA", type="pil")
                         normal_output = gr.Image(label="Normal Bridge", image_mode="RGBA", type="pil")
-                        
                 with gr.Tab("Multiple Images"):
                     gr.Markdown("<div style='text-align: center; padding: 40px; font-size: 24px;'>Multiple Images functionality is coming soon!</div>")
                         
@@ -209,12 +206,16 @@ with gr.Blocks(css="footer {visibility: hidden}") as demo:
                 )
                 download_btn = gr.DownloadButton(label="Export Mesh", interactive=False)
 
+    # Hidden state to carry the raw mesh path (string) between events
+    mesh_path_state = gr.State(value=None)
+
     image_prompt.upload(
         preprocess_image,
         inputs=[image_prompt],
         outputs=[image_prompt]
     )
     
+    # Generate and set UI outputs + state
     gen_shape_btn.click(
         generate_3d,
         inputs=[
@@ -222,34 +223,27 @@ with gr.Blocks(css="footer {visibility: hidden}") as demo:
             ss_guidance_strength, ss_sampling_steps,
             slat_guidance_strength, slat_sampling_steps
         ],
-        outputs=[normal_output, model_output, download_btn]
+        outputs=[normal_output, model_output, mesh_path_state]
     ).then(
-        lambda: gr.Button(interactive=True),
+        # After generation finishes, enable the Download button
+        lambda: gr.DownloadButton.update(interactive=True),
+        outputs=[download_btn],
+    )
+
+    # Click-to-export: convert mesh to the selected format and feed the file path to the DownloadButton
+    download_btn.click(
+        convert_mesh,
+        inputs=[mesh_path_state, export_format],
         outputs=[download_btn],
     )
     
-    
-    def update_download_button(mesh_path, export_format):
-        if not mesh_path:
-            return gr.File.update(value=None, interactive=False)
-        
-        download_path = convert_mesh(mesh_path, export_format)
-        return download_path
-    
-    export_format.change(
-        update_download_button,
-        inputs=[model_output, export_format],
-        outputs=[download_btn]
-    ).then(
-        lambda: gr.Button(interactive=True),
-        outputs=[download_btn],
-    )
-    
+    # Examples: guard against missing assets folder
+    try:
+        example_images = [f'assets/example_image/{image}' for image in os.listdir("assets/example_image")]
+    except FileNotFoundError:
+        example_images = []
     examples = gr.Examples(
-        examples=[
-            f'assets/example_image/{image}'
-            for image in os.listdir("assets/example_image")
-        ],
+        examples=example_images,
         inputs=image_prompt,
     )
 
@@ -272,10 +266,24 @@ if __name__ == "__main__":
 
     # Initialize normal predictor
     try:
-        normal_predictor = torch.hub.load(os.path.join(torch.hub.get_dir(), 'hugoycj_StableNormal_main'), "StableNormal_turbo", yoso_version='yoso-normal-v1-8-1', source='local', local_cache_dir='./weights', pretrained=True)
-    except:
-        normal_predictor = torch.hub.load("hugoycj/StableNormal", "StableNormal_turbo", trust_repo=True, yoso_version='yoso-normal-v1-8-1', local_cache_dir='./weights')    
+        normal_predictor = torch.hub.load(
+            os.path.join(torch.hub.get_dir(), 'hugoycj_StableNormal_main'),
+            "StableNormal_turbo",
+            yoso_version='yoso-normal-v1-8-1',
+            source='local',
+            local_cache_dir='./weights',
+            pretrained=True
+        )
+    except Exception as e:
+        print(f"Local StableNormal load failed: {e}. Falling back to remote hub.")
+        normal_predictor = torch.hub.load(
+            "hugoycj/StableNormal",
+            "StableNormal_turbo",
+            trust_repo=True,
+            yoso_version='yoso-normal-v1-8-1',
+            local_cache_dir='./weights'
+        )
 
-    # Launch the app
+    # Launch the app; keep API minimal to avoid schema mismatches
+    demo.queue()
     demo.launch(share=False, server_name="0.0.0.0")
-
